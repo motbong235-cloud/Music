@@ -82,14 +82,18 @@ def save_stats(stats: dict):
     tmp.replace(STATS_FILE)  # atomic write ការពារ corrupt file
 
 
+_KIND_PLURAL = {"search": "searches", "download": "downloads"}
+
+
 def record_event(user_id: int, kind: str):
     """kind: 'search' ឬ 'download' - រក្សាទុកជា JSON លើ persistent disk"""
+    plural = _KIND_PLURAL[kind]
     with STATS_LOCK:
         stats = load_stats()
-        stats[f"total_{kind}s"] = stats.get(f"total_{kind}s", 0) + 1
+        stats[f"total_{plural}"] = stats.get(f"total_{plural}", 0) + 1
         uid = str(user_id)
         user_stat = stats["users"].setdefault(uid, {"searches": 0, "downloads": 0})
-        user_stat[f"{kind}s"] += 1
+        user_stat[plural] += 1
         save_stats(stats)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

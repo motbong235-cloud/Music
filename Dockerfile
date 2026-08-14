@@ -10,6 +10,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# yt-dlp ត្រូវ update ជាប្រចាំ ព្រោះ YouTube ផ្លាស់ប្តូរ detection ញឹកញាប់
+# ការ install ថ្មីបំផុតត្រង់ពេល build ជួយកាត់បន្ថយហានិភ័យត្រូវ block
+RUN pip install --no-cache-dir --upgrade yt-dlp
+
 COPY song_search_bot.py .
 
 # DATA_DIR (persistent disk) - mount point កំណត់ក្នុង render.yaml

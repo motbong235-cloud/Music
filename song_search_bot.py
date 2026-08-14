@@ -161,33 +161,49 @@ def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
 
 
 def download_audio(video_id: str) -> Path:
-    """ទាញយក audio (mp3) ពី YouTube video id"""
+    """ទាញយក audio (mp3) ពី YouTube video id
+    សាកល្បង player client ជាច្រើនតាមលំដាប់ (fallback chain) ដើម្បីជៀសវាង
+    'Sign in to confirm you're not a bot' ដែលកើតលើ client ខ្លះ។
+    """
     out_template = str(DOWNLOAD_DIR / f"{video_id}.%(ext)s")
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "bestaudio/best",
-        "outtmpl": out_template,
-        "noplaylist": True,
-        # "android" client ជៀសផុតការចាប់ (bot detection) បានប្រសើរជាង "web"
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-    }
-    if YTDLP_COOKIES_FILE and Path(YTDLP_COOKIES_FILE).exists():
-        ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
-
     url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+
+    # លំដាប់ client ត្រូវសាកល្បង - ios/android_music ជាធម្មតាមិនសូវត្រូវ block
+    # ដូច web/android ព្រោះមិនតម្រូវ PO Token ដូចគ្នា
+    CLIENT_CHAIN = ["ios", "android_music", "android", "tv_embedded", "web"]
 
     mp3_path = DOWNLOAD_DIR / f"{video_id}.mp3"
-    if not mp3_path.exists():
-        raise FileNotFoundError("ការទាញយកបរាជ័យ")
-    return mp3_path
+    last_error = None
+
+    for client in CLIENT_CHAIN:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": [client]}},
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+        if YTDLP_COOKIES_FILE and Path(YTDLP_COOKIES_FILE).exists():
+            ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            if mp3_path.exists():
+                log.info("download succeeded with client=%s", client)
+                return mp3_path
+        except Exception as ex:
+            last_error = ex
+            log.warning("client=%s failed: %s", client, ex)
+            continue
+
+    raise FileNotFoundError(f"ការទាញយកបរាជ័យលើ client ទាំងអស់: {last_error}")
 
 
 def cleanup_file(path: Path, delay: int = 30):

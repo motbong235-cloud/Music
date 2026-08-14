@@ -17,28 +17,31 @@ README.md             -> ឯកសារនេះ
 
 ### ជម្រើសទី១ - ប្រើ Blueprint (`render.yaml`) [ណែនាំ]
 
+> ⚠️ **ចំណាំសំខាន់:** Render **Free tier មិន support Persistent Disk ទេ**។
+> Blueprint នេះកំណត់ `plan: starter` ($7/ខែ) ដើម្បីអាចប្រើ Persistent Disk
+> សម្រាប់ទុកទិន្នន័យមិនឲ្យបាត់ពេល redeploy។
+
 1. Upload ទាំង folder នេះទៅ GitHub repository
 2. លើ Render Dashboard → **New** → **Blueprint**
 3. ភ្ជាប់ repository → Render នឹងអាន `render.yaml` ស្វ័យប្រវត្តិ
    (រួមទាំង Persistent Disk `/data` ដែលបានកំណត់រួច)
 4. Render នឹងសួររក Environment Variables ដែលសម្គាល់ `sync: false`:
    - `BOT_TOKEN` — Token ពី @BotFather
-   - `YOUTUBE_API_KEY` — Key ពី Google Cloud Console
 5. ចុច **Apply** → Render នឹង build និង deploy ស្វ័យប្រវត្តិ (រួមទាំង ffmpeg តាម Dockerfile)
 
 ### ជម្រើសទី២ - បង្កើត Web Service ដោយដៃ
 
 1. **New** → **Web Service** → ភ្ជាប់ GitHub repo
 2. Environment: **Docker** (Render នឹងប្រើ `Dockerfile` ស្វ័យប្រវត្តិ)
-3. បន្ថែម Environment Variables:
+3. Instance Type: ជ្រើសរើស **Starter** ($7/ខែ) — ចាំបាច់ ព្រោះ Free tier មិន support Disk
+4. បន្ថែម Environment Variables:
    - `BOT_TOKEN`
-   - `YOUTUBE_API_KEY`
    - `DATA_DIR` = `/data`
-4. **សំខាន់បំផុតសម្រាប់មិនបាត់ទិន្នន័យ:** ទៅ tab **Disks** → **Add Disk**:
+5. **សំខាន់បំផុតសម្រាប់មិនបាត់ទិន្នន័យ:** ទៅ tab **Disks** → **Add Disk**:
    - Name: `song-bot-data`
    - Mount Path: `/data`
    - Size: 1 GB (គ្រប់គ្រាន់)
-5. Save → Deploy
+6. Save → Deploy
 
 ## ហេតុអ្វីត្រូវការ Persistent Disk?
 
@@ -58,7 +61,6 @@ reset ទៅសូន្យរាល់ពេល update កូដ។ នៅព�
 | ឈ្មោះ | ចាំបាច់ | ពិពណ៌នា |
 |---|---|---|
 | `BOT_TOKEN` | ✅ | Token ពី @BotFather |
-| `YOUTUBE_API_KEY` | ✅ | Key ពី Google Cloud Console (YouTube Data API v3) |
 | `DATA_DIR` | ស្រេចចិត្ត (default `./data`) | Path ទៅ Persistent Disk |
 | `YTDLP_COOKIES_FILE` | ស្រេចចិត្ត | Path ទៅ cookies.txt ជួយកាត់បន្ថយការចាប់ពេលទាញយក |
 
@@ -67,6 +69,5 @@ reset ទៅសូន្យរាល់ពេល update កូដ។ នៅព�
 ```bash
 pip install -r requirements.txt --break-system-packages
 export BOT_TOKEN="your_token"
-export YOUTUBE_API_KEY="your_key"
 python song_search_bot.py
 ```

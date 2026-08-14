@@ -5,31 +5,28 @@ Kairozen Song Search Bot
 
 របៀបប្រើ:
   /start          -> ចាប់ផ្តើម
-  វាយចំណងជើងចម្រៀង -> Bot នឹងស្វែងរក 5 លទ្ធផលពី YouTube
+  វាយចំណងជើងចម្រៀង -> Bot នឹងស្វែងរក 5 លទ្ធផលពី YouTube Music
                         ចុចជ្រើសរើសបទដែលចង់បាន -> Bot ផ្ញើជា audio file
 
 Environment Variables (កំណត់នៅលើ Render):
   BOT_TOKEN         -> Token ពី @BotFather
-  YOUTUBE_API_KEY   -> Key ពី https://console.cloud.google.com/apis/credentials
-                       (បើក "YouTube Data API v3" ជាមុនសិន)
   YTDLP_COOKIES_FILE -> (ស្រេចចិត្ត) path ទៅ cookies.txt សម្រាប់ជួយការទាញយក
   DATA_DIR          -> path ទៅ Persistent Disk (Render) សម្រាប់ទុកទិន្នន័យមិនឲ្យបាត់ពេល redeploy
                        ដូចជា /data (មើល render.yaml)
   PORT              -> (Render ផ្តល់ជូនស្វ័យប្រវត្តិ)
 
 ស្ថាបត្យកម្ម ការពារការចាប់ (anti-block):
-  - SEARCH ប្រើ YouTube Data API v3 ជាផ្លូវការ (មិន scrape) -> មិនប្រឈមនឹងការចាប់ទាល់តែសោះ
+  - SEARCH ប្រើ ytmusicapi (មិនត្រូវការ API Key, unauthenticated public search)
   - DOWNLOAD ប្រើ yt-dlp ជាមួយ android player client + cookies (ស្រេចចិត្ត) ដើម្បីកាត់បន្ថយហានិភ័យ
 
 Dependencies (requirements.txt):
   pyTelegramBotAPI
   yt-dlp
   flask
-  requests
+  ytmusicapi
 """
 
 import os
-import re
 import logging
 import tempfile
 import threading
@@ -39,7 +36,7 @@ from pathlib import Path
 import telebot
 from telebot import types
 from flask import Flask
-import requests
+from ytmusicapi import YTMusic
 import yt_dlp
 
 # ---------------------------------------------------------------------------
@@ -48,13 +45,6 @@ import yt_dlp
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise SystemExit("❌ សូមកំណត់ Environment Variable ឈ្មោះ BOT_TOKEN ជាមុនសិន")
-
-# YouTube Data API v3 key (https://console.cloud.google.com/apis/credentials)
-# ប្រើសម្រាប់ SEARCH ប៉ុណ្ណោះ (មិន scrape ទេ -> មិនប្រឈមនឹងការ block)
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
-if not YOUTUBE_API_KEY:
-    raise SystemExit("❌ សូមកំណត់ Environment Variable ឈ្មោះ YOUTUBE_API_KEY ជាមុនសិន "
-                      "(ទាញយកបាននៅ https://console.cloud.google.com/apis/credentials)")
 
 # Cookies file សម្រាប់ yt-dlp download (ជៀសវាងការចាប់ពេលទាញយក) - ស្រេចចិត្ត
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")  # e.g. /etc/secrets/cookies.txt
@@ -107,6 +97,9 @@ log = logging.getLogger("song_search_bot")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+# YTMusic() ដោយគ្មាន auth file -> public unauthenticated search (គ្មានត្រូវការ Key)
+ytmusic = YTMusic()
+
 # in-memory cache: {search_id: [ {id, title, duration, uploader}, ... ]}
 SEARCH_CACHE: dict[str, list[dict]] = {}
 CACHE_LOCK = threading.Lock()
@@ -126,60 +119,39 @@ def format_duration(seconds) -> str:
     return f"{m}:{s:02d}"
 
 
-YT_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
-YT_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
-
-
-def _parse_iso8601_duration(dur: str) -> int:
-    """បំប្លែង ISO 8601 duration (PT3M25S) -> វិនាទី"""
-    if not dur:
+def _duration_to_seconds(duration_str) -> int:
+    """ytmusicapi ផ្តល់ duration ជា 'M:SS' ឬ 'H:MM:SS' string -> បំប្លែងទៅវិនាទី"""
+    if not duration_str:
         return 0
-    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", dur)
-    if not m:
+    parts = str(duration_str).split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
         return 0
-    h, mi, s = (int(g) if g else 0 for g in m.groups())
-    return h * 3600 + mi * 60 + s
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
 
 
 def search_youtube(query: str, limit: int = MAX_RESULTS) -> list[dict]:
-    """ស្វែងរកបទចម្រៀងតាមចំណងជើងតាមរយៈ YouTube Data API v3 (official, មិន scrape)"""
-    # Step 1: search -> video ids
-    search_resp = requests.get(YT_SEARCH_URL, params={
-        "key": YOUTUBE_API_KEY,
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "videoCategoryId": "10",  # Music category
-        "maxResults": limit,
-        "safeSearch": "none",
-    }, timeout=10)
-    search_resp.raise_for_status()
-    items = search_resp.json().get("items", [])
-    if not items:
-        return []
-
-    video_ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
-    if not video_ids:
-        return []
-
-    # Step 2: fetch durations in one batch call
-    videos_resp = requests.get(YT_VIDEOS_URL, params={
-        "key": YOUTUBE_API_KEY,
-        "part": "contentDetails,snippet",
-        "id": ",".join(video_ids),
-    }, timeout=10)
-    videos_resp.raise_for_status()
-    video_items = videos_resp.json().get("items", [])
+    """ស្វែងរកបទចម្រៀងតាមចំណងជើងតាមរយៈ ytmusicapi (public search, គ្មានត្រូវការ API Key)"""
+    raw_results = ytmusic.search(query, filter="songs", limit=limit)
 
     results = []
-    for v in video_items:
-        snippet = v.get("snippet", {})
-        duration = _parse_iso8601_duration(v.get("contentDetails", {}).get("duration", ""))
+    for item in raw_results[:limit]:
+        video_id = item.get("videoId")
+        if not video_id:
+            continue
+        title = item.get("title") or "គ្មានចំណងជើង"
+        artists = item.get("artists") or []
+        uploader = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+        duration_sec = item.get("duration_seconds") or _duration_to_seconds(item.get("duration"))
         results.append({
-            "id": v.get("id"),
-            "title": snippet.get("title") or "គ្មានចំណងជើង",
-            "duration": duration,
-            "uploader": snippet.get("channelTitle", ""),
+            "id": video_id,
+            "title": title,
+            "duration": duration_sec,
+            "uploader": uploader,
         })
     return results
 

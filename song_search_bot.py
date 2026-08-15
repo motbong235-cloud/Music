@@ -1,15 +1,19 @@
 """
-Kairozen Song Search Bot
+Kai Music Bot
 =========================
-ស្វែងរក និងទាញយកចម្រៀងតាមចំណងជើង តាមរយៈ Telegram
+ស្វែងរក និងទាញយកចម្រៀងតាមចំណងជើង + បម្លែងអត្ថបទទៅជាសំឡេង (TTS) តាមរយៈ Telegram
 
 របៀបប្រើ:
   /start          -> ចាប់ផ្តើម
   វាយចំណងជើងចម្រៀង -> Bot នឹងស្វែងរក 5 លទ្ធផលពី YouTube Music
                         ចុចជ្រើសរើសបទដែលចង់បាន -> Bot ផ្ញើជា audio file
+  /tts <អត្ថបទ>   -> បម្លែងអត្ថបទទៅជាសំឡេង (ជ្រើសរើសសំឡេងប្រុស/ស្រី)
+  /admin          -> (Admin ប៉ុណ្ណោះ) មើល User Data + Broadcast សារ
 
 Environment Variables (កំណត់នៅលើ Render):
   BOT_TOKEN         -> Token ពី @BotFather
+  ADMIN_IDS         -> Telegram user ID អ្នកគ្រប់គ្រង (comma-separated សម្រាប់ច្រើននាក់)
+                       ដើម្បីមើល User Data + Broadcast សារ (default: 8266854899)
   YTDLP_COOKIES_FILE -> (ស្រេចចិត្ត) path ទៅ cookies.txt សម្រាប់ជួយការទាញយក
   DATA_DIR          -> path ទៅ Persistent Disk (Render) សម្រាប់ទុកទិន្នន័យមិនឲ្យបាត់ពេល redeploy
                        ដូចជា /data (មើល render.yaml)
@@ -18,12 +22,14 @@ Environment Variables (កំណត់នៅលើ Render):
 ស្ថាបត្យកម្ម ការពារការចាប់ (anti-block):
   - SEARCH ប្រើ ytmusicapi (មិនត្រូវការ API Key, unauthenticated public search)
   - DOWNLOAD ប្រើ yt-dlp ជាមួយ android player client + cookies (ស្រេចចិត្ត) ដើម្បីកាត់បន្ថយហានិភ័យ
+  - TTS ប្រើ edge-tts (Microsoft Edge voices, ឥតគិតថ្លៃ, គ្មានត្រូវការ API Key)
 
 Dependencies (requirements.txt):
   pyTelegramBotAPI
   yt-dlp
   flask
   ytmusicapi
+  edge-tts
 """
 
 import os
@@ -31,6 +37,8 @@ import logging
 import tempfile
 import threading
 import time
+import asyncio
+import uuid
 from pathlib import Path
 
 import telebot
@@ -38,6 +46,7 @@ from telebot import types
 from flask import Flask
 from ytmusicapi import YTMusic
 import yt_dlp
+import edge_tts
 
 # ---------------------------------------------------------------------------
 # Config
@@ -49,10 +58,32 @@ if not BOT_TOKEN:
 # Cookies file សម្រាប់ yt-dlp download (ជៀសវាងការចាប់ពេលទាញយក) - ស្រេចចិត្ត
 YTDLP_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE", "")  # e.g. /etc/secrets/cookies.txt
 
+# Admin IDs (Telegram user id) អាចមើល User Data + Broadcast សារ
+# ដាក់ច្រើននាក់បាន បំបែកដោយ comma ឧ. "8266854899,123456789"
+ADMIN_IDS = set()
+for _part in os.environ.get("ADMIN_IDS", "8266854899").split(","):
+    _part = _part.strip()
+    if _part.isdigit():
+        ADMIN_IDS.add(int(_part))
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 MAX_RESULTS = 5          # ចំនួនលទ្ធផលស្វែងរកបង្ហាញ
 MAX_DURATION_SEC = 1200  # កំណត់រយៈពេលអតិបរមា ២០នាទី (ការពារ file ធំពេក)
 DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "kairozen_song_bot"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# TTS (Text-to-Speech) config - ប្រើ edge-tts (ឥតគិតថ្លៃ, គ្មានត្រូវការ API Key)
+# ---------------------------------------------------------------------------
+MAX_TTS_CHARS = 500  # កំណត់ប្រវែងអត្ថបទអតិបរមា
+TTS_VOICES = {
+    "female": "km-KH-SreymomNeural",
+    "male": "km-KH-PisethNeural",
+}
 
 # ---------------------------------------------------------------------------
 # Persistent data (មិនបាត់ទិន្នន័យពេល redeploy/update)
@@ -82,24 +113,83 @@ def save_stats(stats: dict):
     tmp.replace(STATS_FILE)  # atomic write ការពារ corrupt file
 
 
-_KIND_PLURAL = {"search": "searches", "download": "downloads"}
+_KIND_LABELS = {"search": "ស្វែងរក", "download": "ទាញយក", "tts": "បម្លែងសំឡេង (TTS)"}
 
 
 def record_event(user_id: int, kind: str):
-    """kind: 'search' ឬ 'download' - រក្សាទុកជា JSON លើ persistent disk"""
-    plural = _KIND_PLURAL[kind]
+    """kind: 'search' / 'download' / 'tts' - រក្សាទុកជា JSON លើ persistent disk"""
     with STATS_LOCK:
         stats = load_stats()
-        stats[f"total_{plural}"] = stats.get(f"total_{plural}", 0) + 1
+        stats[f"total_{kind}"] = stats.get(f"total_{kind}", 0) + 1
         uid = str(user_id)
-        user_stat = stats["users"].setdefault(uid, {"searches": 0, "downloads": 0})
-        user_stat[plural] += 1
+        user_stat = stats["users"].setdefault(uid, {})
+        user_stat[kind] = user_stat.get(kind, 0) + 1
         save_stats(stats)
+
+
+# ---------------------------------------------------------------------------
+# User directory (សម្រាប់ Admin Panel: មើល User Data + Broadcast)
+# ---------------------------------------------------------------------------
+USERS_FILE = DATA_DIR / "users.json"
+USERS_LOCK = threading.Lock()
+
+
+def load_users() -> dict:
+    if USERS_FILE.exists():
+        try:
+            import json
+            return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("users.json corrupted, starting fresh")
+    return {}
+
+
+def save_users(users: dict):
+    import json
+    tmp = USERS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(USERS_FILE)
+
+
+def register_user(user):
+    """កត់ត្រាអ្នកប្រើរាល់ពេលមាន message ចូល - ប្រើសម្រាប់ Admin Panel"""
+    if not user:
+        return
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with USERS_LOCK:
+        users = load_users()
+        uid = str(user.id)
+        if uid not in users:
+            users[uid] = {
+                "username": user.username or "",
+                "first_name": user.first_name or "",
+                "joined_at": now,
+                "last_active": now,
+            }
+        else:
+            users[uid]["last_active"] = now
+            if user.username:
+                users[uid]["username"] = user.username
+            if user.first_name:
+                users[uid]["first_name"] = user.first_name
+        save_users(users)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("song_search_bot")
 
+# ត្រូវ enable មុនបង្កើត bot instance ដើម្បីប្រើ @bot.middleware_handler
+telebot.apihelper.ENABLE_MIDDLEWARE = True
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+
+@bot.middleware_handler(update_types=["message"])
+def track_user_middleware(bot_instance, message):
+    """កត់ត្រា user គ្រប់ message ចូល - ប្រើសម្រាប់ Admin Panel (User Data)"""
+    try:
+        register_user(message.from_user)
+    except Exception as ex:
+        log.warning("user tracking failed: %s", ex)
 
 # YTMusic() ដោយគ្មាន auth file -> public unauthenticated search (គ្មានត្រូវការ Key)
 ytmusic = YTMusic()
@@ -107,6 +197,12 @@ ytmusic = YTMusic()
 # in-memory cache: {search_id: [ {id, title, duration, uploader}, ... ]}
 SEARCH_CACHE: dict[str, list[dict]] = {}
 CACHE_LOCK = threading.Lock()
+
+# in-memory cache: {tts_id: text} - រក្សាទុកអត្ថបទបណ្តោះអាសន្នរង់ចាំជ្រើសរើសសំឡេង
+TTS_CACHE: dict[str, str] = {}
+
+# in-memory cache: {broadcast_id: (source_chat_id, source_message_id)}
+BROADCAST_CACHE: dict[str, tuple] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -218,36 +314,291 @@ def cleanup_file(path: Path, delay: int = 30):
     threading.Thread(target=_rm, daemon=True).start()
 
 
+def generate_tts(text: str, voice: str) -> Path:
+    """បម្លែងអត្ថបទទៅជាសំឡេង (mp3) ដោយប្រើ edge-tts"""
+    out_path = DOWNLOAD_DIR / f"tts_{uuid.uuid4().hex}.mp3"
+
+    async def _run():
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(str(out_path))
+
+    asyncio.run(_run())
+
+    if not out_path.exists():
+        raise FileNotFoundError("ការបម្លែងសំឡេងបរាជ័យ")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Main menu buttons (Reply Keyboard - នៅជាប់ជានិច្ចនៅផ្នែកខាងក្រោម chat)
+# ---------------------------------------------------------------------------
+BTN_SEARCH = "🔍 ស្វែងរកចម្រៀង"
+BTN_TTS = "🔊 បម្លែងអត្ថបទជាសំឡេង"
+BTN_STATS = "📊 ស្ថិតិរបស់ខ្ញុំ"
+
+MAIN_MENU = types.ReplyKeyboardMarkup(resize_keyboard=True)
+MAIN_MENU.row(BTN_SEARCH, BTN_TTS)
+MAIN_MENU.row(BTN_STATS)
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+BOT_NAME = "🎵 Kai Music"
+
+
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
+    first_name = message.from_user.first_name or "មិត្តភក្តិ"
     bot.send_message(
         message.chat.id,
-        "🎵 <b>Kairozen Song Search Bot</b>\n\n"
-        "សូមវាយ <b>ចំណងជើងចម្រៀង</b> ដែលអ្នកចង់ស្វែងរក ខ្ញុំនឹងផ្ញើលទ្ធផលឲ្យអ្នកជ្រើសរើស។\n\n"
-        "ឧទាហរណ៍៖ <code>ភ្លៀងធ្លាក់តែឯង</code>",
+        f"👋 សួស្តី <b>{first_name}</b>!\n\n"
+        f"សូមស្វាគមន៍មកកាន់ <b>{BOT_NAME}</b> 🎧\n"
+        "ជំនួយការស្វែងរកចម្រៀង និងបម្លែងអត្ថបទជាសំឡេងរបស់អ្នក។\n\n"
+        "✨ <b>អ្វីដែលខ្ញុំធ្វើបាន៖</b>\n"
+        "🔍 ស្វែងរក ​និងទាញយកចម្រៀងតាមចំណងជើង\n"
+        "🔊 បម្លែងអត្ថបទទៅជាសំឡេង (ខ្មែរ/អង់គ្លេស)\n\n"
+        "👇 ជ្រើសរើសមុខងារពីប៊ូតុងខាងក្រោម ឬវាយចំណងជើងចម្រៀងផ្ទាល់៖",
+        reply_markup=MAIN_MENU,
     )
+
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_SEARCH)
+def btn_search(message):
+    msg = bot.reply_to(message, "🔍 សូមវាយ <b>ចំណងជើងចម្រៀង</b> ដែលអ្នកចង់ស្វែងរក")
+    bot.register_next_step_handler(msg, handle_search)
+
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_TTS)
+def btn_tts(message):
+    msg = bot.reply_to(message, "🔊 សូមផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង (ខ្មែរ ឬអង់គ្លេស)")
+    bot.register_next_step_handler(msg, _process_tts_text)
+
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_STATS)
+def btn_stats(message):
+    cmd_stats(message)
+
+
+# ---------------------------------------------------------------------------
+# Admin Panel (មើល User Data + Broadcast សារទៅអ្នកប្រើទាំងអស់)
+# ---------------------------------------------------------------------------
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message):
+    if not is_admin(message.from_user.id):
+        return  # មិនឆ្លើយតបទាល់តែសោះ ដើម្បីមិនបង្ហាញថាមាន admin feature
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("👥 អ្នកប្រើប្រាស់", callback_data="admin:users"),
+        types.InlineKeyboardButton("📊 ស្ថិតិទាំងអស់", callback_data="admin:stats"),
+        types.InlineKeyboardButton("📢 ផ្ញើសារទៅអ្នកប្រើទាំងអស់", callback_data="admin:broadcast"),
+    )
+    bot.send_message(message.chat.id, "🛠 <b>Kai Music — Admin Panel</b>", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:"))
+def handle_admin_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ អ្នកគ្មានសិទ្ធិប្រើមុខងារនេះទេ")
+        return
+
+    action = call.data.split(":", 1)[1]
+    bot.answer_callback_query(call.id)
+
+    if action == "users":
+        users = load_users()
+        total = len(users)
+        items = sorted(users.items(), key=lambda kv: kv[1].get("joined_at", ""), reverse=True)[:15]
+        lines = [f"👥 <b>អ្នកប្រើសរុប៖ {total}</b>", ""]
+        for uid, info in items:
+            uname = f"@{info['username']}" if info.get("username") else (info.get("first_name") or "(គ្មានឈ្មោះ)")
+            lines.append(f"• {uname} — <code>{uid}</code>\n  ចូលចាប់ផ្តើម៖ {info.get('joined_at', '?')}")
+        if not items:
+            lines.append("មិនទាន់មានអ្នកប្រើទេ")
+        bot.send_message(call.message.chat.id, "\n".join(lines))
+
+    elif action == "stats":
+        stats = load_stats()
+        users = load_users()
+        lines = [f"📊 <b>ស្ថិតិសរុប Bot</b>", f"អ្នកប្រើសរុប៖ {len(users)}", ""]
+        for kind, label in _KIND_LABELS.items():
+            lines.append(f"{label}សរុប៖ {stats.get(f'total_{kind}', 0)}")
+        bot.send_message(call.message.chat.id, "\n".join(lines))
+
+    elif action == "broadcast":
+        msg = bot.send_message(
+            call.message.chat.id,
+            "📢 សូមផ្ញើសារដែលអ្នកចង់ Broadcast (អត្ថបទ/រូបភាព/វីដេអូ/file អ្វីក៏បាន)",
+        )
+        bot.register_next_step_handler(msg, _capture_broadcast_content)
+
+
+def _capture_broadcast_content(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    bid = uuid.uuid4().hex[:10]
+    with CACHE_LOCK:
+        BROADCAST_CACHE[bid] = (message.chat.id, message.message_id)
+
+    users = load_users()
+    count = len(users)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ បញ្ជាក់ផ្ញើ", callback_data=f"bcast:{bid}:go"),
+        types.InlineKeyboardButton("❌ បោះបង់", callback_data=f"bcast:{bid}:cancel"),
+    )
+    bot.reply_to(message, f"📢 នឹងផ្ញើសារនេះទៅអ្នកប្រើ <b>{count}</b> នាក់។ បញ្ជាក់ទេ?", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("bcast:"))
+def handle_broadcast_confirm(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ អ្នកគ្មានសិទ្ធិប្រើមុខងារនេះទេ")
+        return
+
+    try:
+        _, bid, action = call.data.split(":", 2)
+    except Exception:
+        bot.answer_callback_query(call.id, "❌ ទិន្នន័យមិនត្រឹមត្រូវ")
+        return
+
+    with CACHE_LOCK:
+        ref = BROADCAST_CACHE.pop(bid, None)
+
+    if action == "cancel" or not ref:
+        bot.answer_callback_query(call.id, "បានបោះបង់")
+        bot.edit_message_text("❌ បានបោះបង់ Broadcast", call.message.chat.id, call.message.message_id)
+        return
+
+    bot.answer_callback_query(call.id, "🚀 កំពុងផ្ញើ...")
+    bot.edit_message_text("🚀 កំពុងផ្ញើសារទៅអ្នកប្រើទាំងអស់... (នេះអាចចំណាយពេលបន្តិច)",
+                           call.message.chat.id, call.message.message_id)
+
+    src_chat_id, src_msg_id = ref
+    threading.Thread(
+        target=_run_broadcast,
+        args=(call.message.chat.id, call.message.message_id, src_chat_id, src_msg_id),
+        daemon=True,
+    ).start()
+
+
+def _run_broadcast(admin_chat_id: int, status_msg_id: int, src_chat_id: int, src_msg_id: int):
+    """ផ្ញើសារទៅអ្នកប្រើទាំងអស់ដោយប្រើ copy_message (support content ណាមួយក៏បាន)"""
+    users = load_users()
+    total = len(users)
+    success = 0
+    failed = 0
+
+    for uid_str in list(users.keys()):
+        try:
+            bot.copy_message(int(uid_str), src_chat_id, src_msg_id)
+            success += 1
+        except Exception as ex:
+            failed += 1
+            log.debug("broadcast failed for %s: %s", uid_str, ex)
+        time.sleep(0.05)  # ជៀសវាង Telegram rate limit (~20 msg/sec)
+
+    summary = (
+        f"✅ <b>Broadcast រួចរាល់!</b>\n"
+        f"សរុប៖ {total}\n"
+        f"ជោគជ័យ៖ {success}\n"
+        f"បរាជ័យ៖ {failed} (ប្រហែលជា block bot ឬលុប chat)"
+    )
+    try:
+        bot.edit_message_text(summary, admin_chat_id, status_msg_id)
+    except Exception:
+        bot.send_message(admin_chat_id, summary)
 
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
     stats = load_stats()
     uid = str(message.from_user.id)
-    my_stat = stats["users"].get(uid, {"searches": 0, "downloads": 0})
-    bot.reply_to(
-        message,
-        f"📊 <b>ស្ថិតិរបស់អ្នក</b>\n"
-        f"ស្វែងរក៖ {my_stat['searches']} ដង\n"
-        f"ទាញយក៖ {my_stat['downloads']} ដង\n\n"
-        f"📈 <b>ស្ថិតិសរុប Bot</b>\n"
-        f"ស្វែងរកសរុប៖ {stats.get('total_searches', 0)}\n"
-        f"ទាញយកសរុប៖ {stats.get('total_downloads', 0)}",
+    my_stat = stats["users"].get(uid, {})
+    lines = ["📊 <b>ស្ថិតិរបស់អ្នក</b>"]
+    for kind, label in _KIND_LABELS.items():
+        lines.append(f"{label}៖ {my_stat.get(kind, 0)} ដង")
+    lines.append("")
+    lines.append("📈 <b>ស្ថិតិសរុប Bot</b>")
+    for kind, label in _KIND_LABELS.items():
+        lines.append(f"{label}សរុប៖ {stats.get(f'total_{kind}', 0)}")
+    bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=["tts"])
+def cmd_tts(message):
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        msg = bot.reply_to(message, "🔊 សូមផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង (ខ្មែរ ឬអង់គ្លេស)")
+        bot.register_next_step_handler(msg, _process_tts_text)
+        return
+    _start_tts_flow(message, text)
+
+
+def _process_tts_text(message):
+    if message.content_type != "text":
+        bot.reply_to(message, "⚠️ សូមផ្ញើជាអត្ថបទ")
+        return
+    _start_tts_flow(message, message.text.strip())
+
+
+def _start_tts_flow(message, text: str):
+    if not text:
+        bot.reply_to(message, "⚠️ អត្ថបទទទេ សូមព្យាយាមម្តងទៀត")
+        return
+    if len(text) > MAX_TTS_CHARS:
+        bot.reply_to(message, f"⚠️ អត្ថបទវែងពេក (កំណត់អតិបរមា {MAX_TTS_CHARS} តួអក្សរ)")
+        return
+
+    tts_id = uuid.uuid4().hex[:10]
+    with CACHE_LOCK:
+        TTS_CACHE[tts_id] = text
+
+    preview = text if len(text) <= 200 else text[:200] + "..."
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("👩 សំឡេងស្រី", callback_data=f"tts:{tts_id}:female"),
+        types.InlineKeyboardButton("👨 សំឡេងប្រុស", callback_data=f"tts:{tts_id}:male"),
     )
+    bot.reply_to(message, f"🔊 សូមជ្រើសរើសសំឡេងសម្រាប់៖\n<i>{preview}</i>", reply_markup=markup)
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("tts:"))
+def handle_tts_pick(call):
+    try:
+        _, tts_id, voice_key = call.data.split(":", 2)
+    except Exception:
+        bot.answer_callback_query(call.id, "❌ ទិន្នន័យមិនត្រឹមត្រូវ")
+        return
+
+    with CACHE_LOCK:
+        text = TTS_CACHE.pop(tts_id, None)
+
+    if not text:
+        bot.answer_callback_query(call.id, "⌛ សំណើនេះផុតកំណត់ សូមព្យាយាមម្តងទៀត")
+        return
+
+    voice = TTS_VOICES.get(voice_key, TTS_VOICES["female"])
+    bot.answer_callback_query(call.id, "🔊 កំពុងបង្កើតសំឡេង...")
+    status = bot.send_message(call.message.chat.id, "🔊 កំពុងបង្កើតសំឡេង...")
+
+    try:
+        audio_path = generate_tts(text, voice)
+        with open(audio_path, "rb") as f:
+            bot.send_voice(call.message.chat.id, f)
+        cleanup_file(audio_path, delay=15)
+        bot.delete_message(call.message.chat.id, status.message_id)
+        record_event(call.from_user.id, "tts")
+    except Exception as ex:
+        log.exception("tts failed")
+        bot.edit_message_text("❌ បម្លែងសំឡេងមិនបានទេ សូមព្យាយាមម្តងទៀត",
+                               call.message.chat.id, status.message_id)
+
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/")
+                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_STATS))
 def handle_search(message):
     query = message.text.strip()
     if len(query) < 2:
@@ -334,7 +685,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ Kairozen Song Search Bot កំពុងដំណើរការ"
+    return "✅ Kai Music Bot កំពុងដំណើរការ"
 
 
 def run_flask():

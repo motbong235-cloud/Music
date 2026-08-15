@@ -11,7 +11,14 @@ Kai Music Bot
   ផ្ញើរូបភាព       -> ធ្វើឲ្យរូបភាពច្បាស់ស្វ័យប្រវត្តិ (upscale + sharpen)
                      ឬចុច "✂️ កាត់ផ្ទៃខាងក្រោយ" ដើម្បីកាត់ background ចេញ
                      ឬចុច "🔗 ធ្វើរូបភាពជា URL" ដើម្បីទទួល link ថេរ
+                     ឬចុច "📝 Copy អក្សរពីរូបភាព" ដើម្បីទាញអក្សរចេញ (OCR)
   /admin          -> (Admin ប៉ុណ្ណោះ) មើល User Data + Broadcast សារ
+  /referral       -> មើល link ណែនាំមិត្ត + ស្ថិតិ bonus
+
+Rate Limiting (Fair Use):
+  - មុខងារនីមួយៗ (search/tts/enhance/removebg/img2url) ប្រើបានតែ 2 ដង/12ម៉ោង/user
+  - ណែនាំមិត្ត 1 នាក់ចូលរួម Bot (តាម /referral link) = ទទួល +2 ដងបន្ថែម
+  - Admin (តាម ADMIN_IDS) មិនកំណត់ទេ
 
 Environment Variables (កំណត់នៅលើ Render):
   BOT_TOKEN         -> Token ពី @BotFather
@@ -39,6 +46,7 @@ Dependencies (requirements.txt):
   Pillow
   rembg
   requests
+  pytesseract
 """
 
 import os
@@ -48,6 +56,7 @@ import threading
 import time
 import asyncio
 import uuid
+import html
 from pathlib import Path
 
 import telebot
@@ -174,6 +183,7 @@ _KIND_LABELS = {
     "enhance": "ធ្វើរូបភាពច្បាស់",
     "removebg": "កាត់ផ្ទៃខាងក្រោយ",
     "img2url": "រូបភាពទៅ URL",
+    "ocr": "Copy អក្សរពីរូបភាព",
 }
 
 
@@ -212,20 +222,25 @@ def save_users(users: dict):
     tmp.replace(USERS_FILE)
 
 
-def register_user(user):
-    """កត់ត្រាអ្នកប្រើរាល់ពេលមាន message ចូល - ប្រើសម្រាប់ Admin Panel"""
+def register_user(user) -> bool:
+    """កត់ត្រាអ្នកប្រើរាល់ពេលមាន message ចូល - ត្រឡប់ True បើជា user ថ្មី"""
     if not user:
-        return
+        return False
     now = time.strftime("%Y-%m-%d %H:%M:%S")
+    is_new = False
     with USERS_LOCK:
         users = load_users()
         uid = str(user.id)
         if uid not in users:
+            is_new = True
             users[uid] = {
                 "username": user.username or "",
                 "first_name": user.first_name or "",
                 "joined_at": now,
                 "last_active": now,
+                "bonus_credits": 0,
+                "referral_count": 0,
+                "referred_by": None,
             }
         else:
             users[uid]["last_active"] = now
@@ -234,6 +249,125 @@ def register_user(user):
             if user.first_name:
                 users[uid]["first_name"] = user.first_name
         save_users(users)
+    return is_new
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting + Referral (2 ครั้ง/12ម៉ោង/មុខងារ, ណែនាំមិត្ត 1 នាក់ = +2 ដងបន្ថែម)
+# ---------------------------------------------------------------------------
+USAGE_FILE = DATA_DIR / "usage.json"
+USAGE_LOCK = threading.Lock()
+
+FREE_LIMIT_PER_WINDOW = 2
+WINDOW_HOURS = 12
+BONUS_PER_REFERRAL = 2
+
+_BOT_USERNAME_CACHE = None
+
+
+def load_usage() -> dict:
+    if USAGE_FILE.exists():
+        try:
+            import json
+            return json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("usage.json corrupted, starting fresh")
+    return {}
+
+
+def save_usage(usage: dict):
+    import json
+    tmp = USAGE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(usage, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(USAGE_FILE)
+
+
+def check_and_consume_quota(user_id: int, kind: str) -> bool:
+    """ត្រូវ 2 ครั้ง/12ម៉ោង/មុខងារ (kind) - Admin មិនកំណត់ទេ
+    បើអស់ quota ឥតគិតថ្លៃ ព្យាយាមប្រើ bonus_credits (ទទួលបានពី referral) ជំនួស
+    """
+    if is_admin(user_id):
+        return True
+
+    now = time.time()
+    window_start = now - WINDOW_HOURS * 3600
+    uid = str(user_id)
+
+    with USAGE_LOCK:
+        usage = load_usage()
+        timestamps = [t for t in usage.get(uid, {}).get(kind, []) if t > window_start]
+
+        if len(timestamps) < FREE_LIMIT_PER_WINDOW:
+            timestamps.append(now)
+            usage.setdefault(uid, {})[kind] = timestamps
+            save_usage(usage)
+            return True
+
+        # អស់ quota ឥតគិតថ្លៃហើយ - សាកល្បង bonus credit
+        with USERS_LOCK:
+            users = load_users()
+            if users.get(uid, {}).get("bonus_credits", 0) > 0:
+                users[uid]["bonus_credits"] -= 1
+                save_users(users)
+                timestamps.append(now)
+                usage.setdefault(uid, {})[kind] = timestamps
+                save_usage(usage)
+                return True
+
+    return False
+
+
+def get_bot_username() -> str:
+    global _BOT_USERNAME_CACHE
+    if _BOT_USERNAME_CACHE is None:
+        try:
+            _BOT_USERNAME_CACHE = bot.get_me().username
+        except Exception as ex:
+            log.warning("get bot username failed: %s", ex)
+            _BOT_USERNAME_CACHE = ""
+    return _BOT_USERNAME_CACHE
+
+
+def build_referral_link(user_id: int) -> str:
+    username = get_bot_username()
+    if not username:
+        return ""
+    return f"https://t.me/{username}?start=ref{user_id}"
+
+
+def credit_referral(referrer_id: int, new_user_id: int) -> bool:
+    """ផ្តល់ bonus +2 ដងទៅ referrer ពេលមានមិត្តថ្មីចូលរួមតាម link របស់គេ
+    ត្រឡប់ True បើផ្តល់ credit ជោគជ័យ (គ្មាន double-credit)
+    """
+    if referrer_id == new_user_id:
+        return False
+    with USERS_LOCK:
+        users = load_users()
+        ref_uid, new_uid = str(referrer_id), str(new_user_id)
+        if ref_uid not in users or new_uid not in users:
+            return False
+        if users[new_uid].get("referred_by"):
+            return False  # already credited ដងមុនហើយ
+        users[new_uid]["referred_by"] = ref_uid
+        users[ref_uid]["bonus_credits"] = users[ref_uid].get("bonus_credits", 0) + BONUS_PER_REFERRAL
+        users[ref_uid]["referral_count"] = users[ref_uid].get("referral_count", 0) + 1
+        save_users(users)
+        return True
+
+
+def send_quota_exceeded(chat_id: int, user_id: int, kind: str):
+    label = _KIND_LABELS.get(kind, kind)
+    link = build_referral_link(user_id)
+    text = (
+        f"⏳ អ្នកបានប្រើមុខងារ <b>{label}</b> គ្រប់ចំនួន {FREE_LIMIT_PER_WINDOW} ដង "
+        f"ក្នុងរយៈពេល {WINDOW_HOURS} ម៉ោងហើយ។\n\n"
+        f"ចង់ប្រើបន្ត? ណែនាំមិត្ត ១ នាក់ចូលរួម Bot នេះ តាម link ខាងក្រោម "
+        f"នឹងទទួលបានសិទ្ធិប្រើបន្ថែម {BONUS_PER_REFERRAL} ដងភ្លាមៗ៖"
+    )
+    if link:
+        text += f"\n\n<code>{link}</code>"
+    bot.send_message(chat_id, text)
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("song_search_bot")
@@ -246,11 +380,12 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 @bot.middleware_handler(update_types=["message"])
 def track_user_middleware(bot_instance, message):
-    """កត់ត្រា user គ្រប់ message ចូល - ប្រើសម្រាប់ Admin Panel (User Data)"""
+    """កត់ត្រា user គ្រប់ message ចូល - ដាក់ flag is_new_user លើ message សម្រាប់ referral"""
     try:
-        register_user(message.from_user)
+        message.is_new_user = register_user(message.from_user)
     except Exception as ex:
         log.warning("user tracking failed: %s", ex)
+        message.is_new_user = False
 
 # YTMusic() ដោយគ្មាន auth file -> public unauthenticated search (គ្មានត្រូវការ Key)
 ytmusic = YTMusic()
@@ -474,6 +609,19 @@ def upload_to_catbox(file_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OCR (Copy អក្សរពីរូបភាព) - ប្រើ Tesseract OCR (ខ្មែរ + អង់គ្លេស)
+# ---------------------------------------------------------------------------
+def extract_text_from_image(input_path: Path) -> str:
+    """ទាញអក្សរចេញពីរូបភាព (khm+eng) ដោយប្រើ pytesseract"""
+    from PIL import Image
+    import pytesseract
+
+    img = Image.open(input_path)
+    text = pytesseract.image_to_string(img, lang="khm+eng")
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # Main menu buttons (Reply Keyboard - នៅជាប់ជានិច្ចនៅផ្នែកខាងក្រោម chat)
 # ---------------------------------------------------------------------------
 BTN_SEARCH = "🔍 ស្វែងរកចម្រៀង"
@@ -481,12 +629,14 @@ BTN_TTS = "🔊 បម្លែងអត្ថបទជាសំឡេង"
 BTN_ENHANCE = "🖼 ធ្វើឲ្យរូបភាពច្បាស់"
 BTN_REMOVE_BG = "✂️ កាត់ផ្ទៃខាងក្រោយ"
 BTN_IMG_URL = "🔗 ធ្វើរូបភាពជា URL"
+BTN_OCR = "📝 Copy អក្សរពីរូបភាព"
 BTN_STATS = "📊 ស្ថិតិរបស់ខ្ញុំ"
 
 MAIN_MENU = types.ReplyKeyboardMarkup(resize_keyboard=True)
 MAIN_MENU.row(BTN_SEARCH, BTN_TTS)
 MAIN_MENU.row(BTN_ENHANCE, BTN_REMOVE_BG)
-MAIN_MENU.row(BTN_IMG_URL, BTN_STATS)
+MAIN_MENU.row(BTN_IMG_URL, BTN_OCR)
+MAIN_MENU.row(BTN_STATS)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +648,24 @@ BOT_NAME = "🎵 Kai Music"
 @bot.message_handler(commands=["start", "help"])
 def cmd_start(message):
     first_name = message.from_user.first_name or "មិត្តភក្តិ"
+
+    # ដោះស្រាយ referral payload: /start ref<user_id>
+    parts = message.text.split(maxsplit=1)
+    if getattr(message, "is_new_user", False) and len(parts) > 1 and parts[1].startswith("ref"):
+        try:
+            referrer_id = int(parts[1][3:])
+            if credit_referral(referrer_id, message.from_user.id):
+                try:
+                    bot.send_message(
+                        referrer_id,
+                        f"🎉 មិត្តរបស់អ្នក <b>{first_name}</b> បានចូលរួម {BOT_NAME} តាម link របស់អ្នក!\n"
+                        f"អ្នកទទួលបានសិទ្ធិប្រើបន្ថែម {BONUS_PER_REFERRAL} ដងភ្លាមៗ 🎁",
+                    )
+                except Exception:
+                    pass
+        except (ValueError, IndexError):
+            pass
+
     bot.send_message(
         message.chat.id,
         f"👋 សួស្តី <b>{first_name}</b>!\n\n"
@@ -508,12 +676,29 @@ def cmd_start(message):
         "🔊 បម្លែងអត្ថបទទៅជាសំឡេង (ខ្មែរ/អង់គ្លេស)\n"
         "🖼 ធ្វើឲ្យរូបភាពច្បាស់ (upscale + sharpen)\n"
         "✂️ កាត់ផ្ទៃខាងក្រោយចេញ (background removal)\n"
-        "🔗 ធ្វើរូបភាពជា URL (link ថេរអាចចែករំលែក)\n\n"
+        "🔗 ធ្វើរូបភាពជា URL (link ថេរអាចចែករំលែក)\n"
+        "📝 Copy អក្សរពីរូបភាព (OCR ខ្មែរ/អង់គ្លេស)\n\n"
+        f"⏳ <i>មុខងារនីមួយៗប្រើបាន {FREE_LIMIT_PER_WINDOW} ដងក្នុង {WINDOW_HOURS} ម៉ោង។ "
+        f"ណែនាំមិត្ត ១ នាក់ = +{BONUS_PER_REFERRAL} ដងបន្ថែម (មើល /referral)</i>\n\n"
         "👇 ជ្រើសរើសមុខងារពីប៊ូតុងខាងក្រោម ឬវាយចំណងជើងចម្រៀងផ្ទាល់៖",
         reply_markup=MAIN_MENU,
     )
     if not is_subscribed(message.from_user.id):
         send_force_sub_prompt(message.chat.id)
+
+
+@bot.message_handler(commands=["referral"])
+def cmd_referral(message):
+    users = load_users()
+    my = users.get(str(message.from_user.id), {})
+    link = build_referral_link(message.from_user.id)
+    bot.reply_to(
+        message,
+        f"🎁 <b>Link ណែនាំមិត្តរបស់អ្នក៖</b>\n<code>{link}</code>\n\n"
+        f"👥 មិត្តដែលចូលរួមរួច៖ {my.get('referral_count', 0)} នាក់\n"
+        f"⭐ សិទ្ធិប្រើបន្ថែមនៅសល់៖ {my.get('bonus_credits', 0)} ដង\n\n"
+        f"រាល់ครั้งមិត្តម្នាក់ chat ជាមួយ link នេះ អ្នកទទួលបាន +{BONUS_PER_REFERRAL} ដងភ្លាមៗ!",
+    )
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "checksub")
@@ -574,6 +759,15 @@ def btn_img_url(message):
     bot.register_next_step_handler(msg, _process_img_url_photo)
 
 
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_OCR)
+def btn_ocr(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    msg = bot.reply_to(message, "📝 សូមផ្ញើ<b>រូបភាព</b>ដែលមានអក្សរ ខ្ញុំនឹង Copy អក្សរនោះចេញឲ្យ (ខ្មែរ/អង់គ្លេស)")
+    bot.register_next_step_handler(msg, _process_ocr_photo)
+
+
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_STATS)
 def btn_stats(message):
     cmd_stats(message)
@@ -632,7 +826,22 @@ def _process_img_url_photo(message):
     _run_img_to_url(message, file_id)
 
 
+def _process_ocr_photo(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    file_id = _extract_image_file_id(message)
+    if not file_id:
+        bot.reply_to(message, "⚠️ សូមផ្ញើជារូបភាព")
+        return
+    _run_ocr(message, file_id)
+
+
 def _run_enhance(message, file_id: str):
+    if not check_and_consume_quota(message.from_user.id, "enhance"):
+        send_quota_exceeded(message.chat.id, message.from_user.id, "enhance")
+        return
+
     status = bot.reply_to(message, "🖼 កំពុងធ្វើឲ្យរូបភាពច្បាស់ សូមរង់ចាំបន្តិច...")
     in_path = out_path = None
     try:
@@ -658,6 +867,10 @@ def _run_enhance(message, file_id: str):
 
 
 def _run_removebg(message, file_id: str):
+    if not check_and_consume_quota(message.from_user.id, "removebg"):
+        send_quota_exceeded(message.chat.id, message.from_user.id, "removebg")
+        return
+
     status = bot.reply_to(message, "✂️ កំពុងកាត់ផ្ទៃខាងក្រោយ សូមរង់ចាំបន្តិច "
                                     "(ครั้งដំបូងអាចយូរជាងគេ ព្រោះកំពុង download model)...")
     in_path = out_path = None
@@ -684,6 +897,10 @@ def _run_removebg(message, file_id: str):
 
 
 def _run_img_to_url(message, file_id: str):
+    if not check_and_consume_quota(message.from_user.id, "img2url"):
+        send_quota_exceeded(message.chat.id, message.from_user.id, "img2url")
+        return
+
     status = bot.reply_to(message, "🔗 កំពុង Upload រូបភាព...")
     in_path = None
     try:
@@ -697,6 +914,48 @@ def _run_img_to_url(message, file_id: str):
     except Exception:
         log.exception("img2url failed")
         bot.edit_message_text("❌ Upload មិនបានទេ សូមព្យាយាមម្តងទៀត",
+                               message.chat.id, status.message_id)
+    finally:
+        if in_path:
+            cleanup_file(in_path, delay=5)
+
+
+def _run_ocr(message, file_id: str):
+    if not check_and_consume_quota(message.from_user.id, "ocr"):
+        send_quota_exceeded(message.chat.id, message.from_user.id, "ocr")
+        return
+
+    status = bot.reply_to(message, "📝 កំពុង Copy អក្សរពីរូបភាព...")
+    in_path = None
+    try:
+        in_path = _download_telegram_image(file_id)
+        text = extract_text_from_image(in_path)
+        record_event(message.from_user.id, "ocr")
+
+        if not text:
+            bot.edit_message_text("😕 រកមិនឃើញអក្សរនៅក្នុងរូបភាពនេះទេ",
+                                   message.chat.id, status.message_id)
+        elif len(text) > 3500:
+            # អត្ថបទវែងពេក - ផ្ញើជា .txt file ជំនួសឲ្យ message
+            txt_path = DOWNLOAD_DIR / f"ocr_{uuid.uuid4().hex}.txt"
+            txt_path.write_text(text, encoding="utf-8")
+            with open(txt_path, "rb") as f:
+                bot.send_document(
+                    message.chat.id, f,
+                    caption="📝 អត្ថបទដែលបាន Copy (វែងពេក ផ្ញើជា file)",
+                    visible_file_name="extracted_text.txt",
+                )
+            cleanup_file(txt_path, delay=20)
+            bot.delete_message(message.chat.id, status.message_id)
+        else:
+            safe_text = html.escape(text)
+            bot.edit_message_text(
+                f"📝 <b>អត្ថបទដែលបាន Copy៖</b>\n\n<code>{safe_text}</code>",
+                message.chat.id, status.message_id,
+            )
+    except Exception:
+        log.exception("ocr failed")
+        bot.edit_message_text("❌ Copy អក្សរមិនបានទេ សូមព្យាយាមម្តងទៀត",
                                message.chat.id, status.message_id)
     finally:
         if in_path:
@@ -852,11 +1111,17 @@ def _run_broadcast(admin_chat_id: int, status_msg_id: int, src_chat_id: int, src
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
     stats = load_stats()
+    users = load_users()
     uid = str(message.from_user.id)
     my_stat = stats["users"].get(uid, {})
+    my_user = users.get(uid, {})
     lines = ["📊 <b>ស្ថិតិរបស់អ្នក</b>"]
     for kind, label in _KIND_LABELS.items():
         lines.append(f"{label}៖ {my_stat.get(kind, 0)} ដង")
+    lines.append("")
+    lines.append(f"⭐ សិទ្ធិប្រើបន្ថែម (bonus)៖ {my_user.get('bonus_credits', 0)} ដង")
+    lines.append(f"👥 មិត្តណែនាំចូលរួម៖ {my_user.get('referral_count', 0)} នាក់")
+    lines.append("(ប្រើ /referral ដើម្បីទទួល link ណែនាំមិត្ត)")
     lines.append("")
     lines.append("📈 <b>ស្ថិតិសរុប Bot</b>")
     for kind, label in _KIND_LABELS.items():
@@ -925,6 +1190,11 @@ def handle_tts_pick(call):
         bot.answer_callback_query(call.id, "⌛ សំណើនេះផុតកំណត់ សូមព្យាយាមម្តងទៀត")
         return
 
+    if not check_and_consume_quota(call.from_user.id, "tts"):
+        bot.answer_callback_query(call.id, "⏳ អស់ចំណុះប្រើប្រាស់", show_alert=True)
+        send_quota_exceeded(call.message.chat.id, call.from_user.id, "tts")
+        return
+
     voice = TTS_VOICES.get(voice_key, TTS_VOICES["female"])
     bot.answer_callback_query(call.id, "🔊 កំពុងបង្កើតសំឡេង...")
     status = bot.send_message(call.message.chat.id, "🔊 កំពុងបង្កើតសំឡេង...")
@@ -943,7 +1213,7 @@ def handle_tts_pick(call):
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/")
-                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_ENHANCE, BTN_REMOVE_BG, BTN_IMG_URL, BTN_STATS))
+                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_ENHANCE, BTN_REMOVE_BG, BTN_IMG_URL, BTN_OCR, BTN_STATS))
 def handle_search(message):
     if not is_subscribed(message.from_user.id):
         send_force_sub_prompt(message.chat.id)
@@ -952,6 +1222,10 @@ def handle_search(message):
     query = message.text.strip()
     if len(query) < 2:
         bot.reply_to(message, "⚠️ សូមវាយចំណងជើងឲ្យបានច្បាស់លាស់ជាងនេះ")
+        return
+
+    if not check_and_consume_quota(message.from_user.id, "search"):
+        send_quota_exceeded(message.chat.id, message.from_user.id, "search")
         return
 
     wait_msg = bot.reply_to(message, f"🔍 កំពុងស្វែងរក <b>{query}</b> ...")

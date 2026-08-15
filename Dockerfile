@@ -2,8 +2,11 @@ FROM python:3.11-slim
 
 # ffmpeg ត្រូវការសម្រាប់ yt-dlp បម្លែងទៅ mp3
 # libglib2.0-0, libgl1 ត្រូវការសម្រាប់ opencv-python-headless (dependency របស់ rembg)
+# tesseract-ocr + tesseract-ocr-khm (ខ្មែរ) + tesseract-ocr-eng (អង់គ្លេស) សម្រាប់ OCR
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg libglib2.0-0 libgl1 && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg libglib2.0-0 libgl1 \
+        tesseract-ocr tesseract-ocr-khm tesseract-ocr-eng && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

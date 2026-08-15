@@ -6,3 +6,4 @@ edge-tts
 Pillow
 rembg
 requests
+pytesseract

@@ -1,6 +1,7 @@
-
 pyTelegramBotAPI
 yt-dlp
 flask
 ytmusicapi
 edge-tts
+Pillow
+rembg

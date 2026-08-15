@@ -8,12 +8,17 @@ Kai Music Bot
   វាយចំណងជើងចម្រៀង -> Bot នឹងស្វែងរក 5 លទ្ធផលពី YouTube Music
                         ចុចជ្រើសរើសបទដែលចង់បាន -> Bot ផ្ញើជា audio file
   /tts <អត្ថបទ>   -> បម្លែងអត្ថបទទៅជាសំឡេង (ជ្រើសរើសសំឡេងប្រុស/ស្រី)
+  ផ្ញើរូបភាព       -> ធ្វើឲ្យរូបភាពច្បាស់ស្វ័យប្រវត្តិ (upscale + sharpen)
+                     ឬចុច "✂️ កាត់ផ្ទៃខាងក្រោយ" ដើម្បីកាត់ background ចេញ
   /admin          -> (Admin ប៉ុណ្ណោះ) មើល User Data + Broadcast សារ
 
 Environment Variables (កំណត់នៅលើ Render):
   BOT_TOKEN         -> Token ពី @BotFather
   ADMIN_IDS         -> Telegram user ID អ្នកគ្រប់គ្រង (comma-separated សម្រាប់ច្រើននាក់)
                        ដើម្បីមើល User Data + Broadcast សារ (default: 8266854899)
+  FORCE_SUB_CHANNEL      -> @username របស់ Channel ដែលតម្រូវ join (ទុកទទេ = បិទមុខងារនេះ)
+  FORCE_SUB_CHANNEL_LINK -> link ចូលរួម Channel (ឧ. https://t.me/channelusername)
+                       ⚠️ Bot ត្រូវតែជា Admin ក្នុង Channel នេះ
   YTDLP_COOKIES_FILE -> (ស្រេចចិត្ត) path ទៅ cookies.txt សម្រាប់ជួយការទាញយក
   DATA_DIR          -> path ទៅ Persistent Disk (Render) សម្រាប់ទុកទិន្នន័យមិនឲ្យបាត់ពេល redeploy
                        ដូចជា /data (មើល render.yaml)
@@ -30,6 +35,8 @@ Dependencies (requirements.txt):
   flask
   ytmusicapi
   edge-tts
+  Pillow
+  rembg
 """
 
 import os
@@ -69,6 +76,50 @@ for _part in os.environ.get("ADMIN_IDS", "8266854899").split(","):
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+# ---------------------------------------------------------------------------
+# Force-Subscribe Channel (តម្រូវ join channel មុនប្រើ Bot)
+# FORCE_SUB_CHANNEL     -> @username របស់ channel (ត្រូវការសម្រាប់ check membership)
+# FORCE_SUB_CHANNEL_LINK -> link សម្រាប់ជាប៊ូតុង join (ឧ. https://t.me/channelusername)
+# ទុកទទេទាំងពីរ ដើម្បីបិទមុខងារនេះ (មិនតម្រូវ)
+# ⚠️ Bot ត្រូវតែជា Admin ក្នុង Channel នេះ ទើប check membership បាន
+# ---------------------------------------------------------------------------
+FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "").strip()
+FORCE_SUB_CHANNEL_LINK = os.environ.get("FORCE_SUB_CHANNEL_LINK", "").strip()
+
+
+def is_subscribed(user_id: int) -> bool:
+    """ត្រួតពិនិត្យថា user បាន join Force-Sub Channel ដែរឬទេ។
+    Admin និង feature ដែលបិទ (គ្មាន FORCE_SUB_CHANNEL) នឹងឆ្លងកាត់ដោយស្វ័យប្រវត្តិ។
+    """
+    if is_admin(user_id):
+        return True
+    if not FORCE_SUB_CHANNEL:
+        return True
+    try:
+        member = bot.get_chat_member(FORCE_SUB_CHANNEL, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as ex:
+        log.warning("force-sub check failed (fail-open): %s", ex)
+        return True  # បើ check បរាជ័យ (ឧ. bot មិនមែន admin) កុំទប់ user ទាំងអស់
+
+
+def send_force_sub_prompt(chat_id: int):
+    if not FORCE_SUB_CHANNEL_LINK:
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("📢 ចូលរួម Channel", url=FORCE_SUB_CHANNEL_LINK),
+        types.InlineKeyboardButton("✅ ខ្ញុំបានចូលរួមហើយ", callback_data="checksub"),
+    )
+    bot.send_message(
+        chat_id,
+        "🔒 <b>ត្រូវការចូលរួម Channel មុនប្រើ Bot</b>\n\n"
+        "សូមចុចប៊ូតុងខាងក្រោមដើម្បីចូលរួម Channel របស់យើង "
+        "រួចចុច «ខ្ញុំបានចូលរួមហើយ»៖",
+        reply_markup=markup,
+    )
 
 
 MAX_RESULTS = 5          # ចំនួនលទ្ធផលស្វែងរកបង្ហាញ
@@ -113,7 +164,13 @@ def save_stats(stats: dict):
     tmp.replace(STATS_FILE)  # atomic write ការពារ corrupt file
 
 
-_KIND_LABELS = {"search": "ស្វែងរក", "download": "ទាញយក", "tts": "បម្លែងសំឡេង (TTS)"}
+_KIND_LABELS = {
+    "search": "ស្វែងរក",
+    "download": "ទាញយក",
+    "tts": "បម្លែងសំឡេង (TTS)",
+    "enhance": "ធ្វើរូបភាពច្បាស់",
+    "removebg": "កាត់ផ្ទៃខាងក្រោយ",
+}
 
 
 def record_event(user_id: int, kind: str):
@@ -330,14 +387,81 @@ def generate_tts(text: str, voice: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Image Enhancement (ធ្វើឲ្យរូបភាពច្បាស់: upscale + sharpen + contrast)
+# ---------------------------------------------------------------------------
+MAX_ENHANCE_DIM = 2200   # ដែនកំណត់ pixel អតិបរមា (ការពារ memory លើសលប់លើ free/starter plan)
+ENHANCE_UPSCALE = 2      # ដង upscale
+
+
+def enhance_image(input_path: Path) -> Path:
+    """ធ្វើឲ្យរូបភាពច្បាស់ជាងមុន៖ upscale (LANCZOS) + unsharp mask + contrast/color boost"""
+    from PIL import Image, ImageFilter, ImageEnhance
+
+    img = Image.open(input_path).convert("RGB")
+    w, h = img.size
+
+    new_w, new_h = w * ENHANCE_UPSCALE, h * ENHANCE_UPSCALE
+    if max(new_w, new_h) > MAX_ENHANCE_DIM:
+        ratio = MAX_ENHANCE_DIM / max(w, h)
+        new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    img = ImageEnhance.Contrast(img).enhance(1.12)
+    img = ImageEnhance.Color(img).enhance(1.08)
+    img = ImageEnhance.Sharpness(img).enhance(1.3)
+
+    out_path = DOWNLOAD_DIR / f"enhanced_{uuid.uuid4().hex}.jpg"
+    img.save(out_path, "JPEG", quality=95)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Background Removal (កាត់ផ្ទៃខាងក្រោយចេញ - ប្រើ rembg, model ស្រាល u2netp)
+# Model cache ទុកក្នុង DATA_DIR ដើម្បីកុំឲ្យ download ថ្មីរាល់ครั้ง redeploy
+# ---------------------------------------------------------------------------
+os.environ.setdefault("U2NET_HOME", str(DATA_DIR / "u2net_models"))
+
+_REMBG_SESSION = None
+_REMBG_LOCK = threading.Lock()
+
+
+def _get_rembg_session():
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        with _REMBG_LOCK:
+            if _REMBG_SESSION is None:
+                from rembg import new_session
+                log.info("loading rembg model (u2netp) - ដំបូងអាចយូរបន្តិចដើម្បី download...")
+                _REMBG_SESSION = new_session("u2netp")
+    return _REMBG_SESSION
+
+
+def remove_background(input_path: Path) -> Path:
+    """កាត់ផ្ទៃខាងក្រោយចេញ -> PNG មាន alpha channel (ថ្លា)"""
+    from rembg import remove
+
+    session = _get_rembg_session()
+    input_bytes = input_path.read_bytes()
+    output_bytes = remove(input_bytes, session=session)
+
+    out_path = DOWNLOAD_DIR / f"nobg_{uuid.uuid4().hex}.png"
+    out_path.write_bytes(output_bytes)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Main menu buttons (Reply Keyboard - នៅជាប់ជានិច្ចនៅផ្នែកខាងក្រោម chat)
 # ---------------------------------------------------------------------------
 BTN_SEARCH = "🔍 ស្វែងរកចម្រៀង"
 BTN_TTS = "🔊 បម្លែងអត្ថបទជាសំឡេង"
+BTN_ENHANCE = "🖼 ធ្វើឲ្យរូបភាពច្បាស់"
+BTN_REMOVE_BG = "✂️ កាត់ផ្ទៃខាងក្រោយ"
 BTN_STATS = "📊 ស្ថិតិរបស់ខ្ញុំ"
 
 MAIN_MENU = types.ReplyKeyboardMarkup(resize_keyboard=True)
 MAIN_MENU.row(BTN_SEARCH, BTN_TTS)
+MAIN_MENU.row(BTN_ENHANCE, BTN_REMOVE_BG)
 MAIN_MENU.row(BTN_STATS)
 
 
@@ -357,27 +481,175 @@ def cmd_start(message):
         "ជំនួយការស្វែងរកចម្រៀង និងបម្លែងអត្ថបទជាសំឡេងរបស់អ្នក។\n\n"
         "✨ <b>អ្វីដែលខ្ញុំធ្វើបាន៖</b>\n"
         "🔍 ស្វែងរក ​និងទាញយកចម្រៀងតាមចំណងជើង\n"
-        "🔊 បម្លែងអត្ថបទទៅជាសំឡេង (ខ្មែរ/អង់គ្លេស)\n\n"
+        "🔊 បម្លែងអត្ថបទទៅជាសំឡេង (ខ្មែរ/អង់គ្លេស)\n"
+        "🖼 ធ្វើឲ្យរូបភាពច្បាស់ (upscale + sharpen)\n"
+        "✂️ កាត់ផ្ទៃខាងក្រោយចេញ (background removal)\n\n"
         "👇 ជ្រើសរើសមុខងារពីប៊ូតុងខាងក្រោម ឬវាយចំណងជើងចម្រៀងផ្ទាល់៖",
         reply_markup=MAIN_MENU,
     )
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "checksub")
+def handle_checksub(call):
+    if is_subscribed(call.from_user.id):
+        bot.answer_callback_query(call.id, "✅ អរគុណ! អ្នកអាចប្រើ Bot បានហើយ")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        bot.send_message(call.message.chat.id, "🎉 ជោគជ័យ! ចុច /start ដើម្បីចាប់ផ្តើមប្រើ Bot")
+    else:
+        bot.answer_callback_query(call.id, "❌ អ្នកមិនទាន់ចូលរួម Channel នៅឡើយទេ", show_alert=True)
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_SEARCH)
 def btn_search(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
     msg = bot.reply_to(message, "🔍 សូមវាយ <b>ចំណងជើងចម្រៀង</b> ដែលអ្នកចង់ស្វែងរក")
     bot.register_next_step_handler(msg, handle_search)
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_TTS)
 def btn_tts(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
     msg = bot.reply_to(message, "🔊 សូមផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង (ខ្មែរ ឬអង់គ្លេស)")
     bot.register_next_step_handler(msg, _process_tts_text)
+
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_ENHANCE)
+def btn_enhance(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    msg = bot.reply_to(message, "🖼 សូមផ្ញើ<b>រូបភាព</b>ដែលអ្នកចង់ធ្វើឲ្យច្បាស់ (ខ្ញុំនឹង upscale + sharpen ស្វ័យប្រវត្តិ)")
+    bot.register_next_step_handler(msg, _process_enhance_photo)
+
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_REMOVE_BG)
+def btn_remove_bg(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    msg = bot.reply_to(message, "✂️ សូមផ្ញើ<b>រូបភាព</b>ដែលអ្នកចង់កាត់ផ្ទៃខាងក្រោយចេញ")
+    bot.register_next_step_handler(msg, _process_removebg_photo)
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_STATS)
 def btn_stats(message):
     cmd_stats(message)
+
+
+def _extract_image_file_id(message):
+    """ត្រឡប់ file_id បើ message ជារូបភាព (photo ឬ image document), បើមិនមែនត្រឡប់ None"""
+    if message.content_type == "document":
+        mime = (message.document.mime_type or "")
+        if not mime.startswith("image/"):
+            return None
+        return message.document.file_id
+    if message.content_type == "photo":
+        return message.photo[-1].file_id  # គុណភាពខ្ពស់បំផុត
+    return None
+
+
+def _download_telegram_image(file_id: str) -> Path:
+    file_info = bot.get_file(file_id)
+    file_bytes = bot.download_file(file_info.file_path)
+    in_path = DOWNLOAD_DIR / f"orig_{uuid.uuid4().hex}.jpg"
+    in_path.write_bytes(file_bytes)
+    return in_path
+
+
+def _process_enhance_photo(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    file_id = _extract_image_file_id(message)
+    if not file_id:
+        bot.reply_to(message, "⚠️ សូមផ្ញើជារូបភាព")
+        return
+    _run_enhance(message, file_id)
+
+
+def _process_removebg_photo(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    file_id = _extract_image_file_id(message)
+    if not file_id:
+        bot.reply_to(message, "⚠️ សូមផ្ញើជារូបភាព")
+        return
+    _run_removebg(message, file_id)
+
+
+def _run_enhance(message, file_id: str):
+    status = bot.reply_to(message, "🖼 កំពុងធ្វើឲ្យរូបភាពច្បាស់ សូមរង់ចាំបន្តិច...")
+    in_path = out_path = None
+    try:
+        in_path = _download_telegram_image(file_id)
+        out_path = enhance_image(in_path)
+        with open(out_path, "rb") as f:
+            bot.send_document(
+                message.chat.id, f,
+                caption="✅ រូបភាពច្បាស់ជាងមុនហើយ!",
+                visible_file_name="enhanced.jpg",
+            )
+        record_event(message.from_user.id, "enhance")
+        bot.delete_message(message.chat.id, status.message_id)
+    except Exception:
+        log.exception("enhance failed")
+        bot.edit_message_text("❌ ធ្វើឲ្យរូបភាពច្បាស់មិនបានទេ សូមព្យាយាមម្តងទៀត",
+                               message.chat.id, status.message_id)
+    finally:
+        if in_path:
+            cleanup_file(in_path, delay=5)
+        if out_path:
+            cleanup_file(out_path, delay=20)
+
+
+def _run_removebg(message, file_id: str):
+    status = bot.reply_to(message, "✂️ កំពុងកាត់ផ្ទៃខាងក្រោយ សូមរង់ចាំបន្តិច "
+                                    "(ครั้งដំបូងអាចយូរជាងគេ ព្រោះកំពុង download model)...")
+    in_path = out_path = None
+    try:
+        in_path = _download_telegram_image(file_id)
+        out_path = remove_background(in_path)
+        with open(out_path, "rb") as f:
+            bot.send_document(
+                message.chat.id, f,
+                caption="✅ បានកាត់ផ្ទៃខាងក្រោយចេញ! (PNG ថ្លា)",
+                visible_file_name="no_background.png",
+            )
+        record_event(message.from_user.id, "removebg")
+        bot.delete_message(message.chat.id, status.message_id)
+    except Exception:
+        log.exception("remove background failed")
+        bot.edit_message_text("❌ កាត់ផ្ទៃខាងក្រោយមិនបានទេ សូមព្យាយាមម្តងទៀត",
+                               message.chat.id, status.message_id)
+    finally:
+        if in_path:
+            cleanup_file(in_path, delay=5)
+        if out_path:
+            cleanup_file(out_path, delay=20)
+
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_photo(message):
+    """ព្រម​ន​ចុចប៊ូតុងមុន: ផ្ញើរូបភាពផ្ទាល់ = default ធ្វើឲ្យច្បាស់ (enhance)"""
+    file_id = _extract_image_file_id(message)
+    if not file_id:
+        return  # document មិនមែនរូបភាព - មិនចាត់ចែង
+
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+
+    _run_enhance(message, file_id)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +801,9 @@ def cmd_stats(message):
 
 @bot.message_handler(commands=["tts"])
 def cmd_tts(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
     text = message.text.partition(" ")[2].strip()
     if not text:
         msg = bot.reply_to(message, "🔊 សូមផ្ញើអត្ថបទដែលអ្នកចង់បម្លែងទៅជាសំឡេង (ខ្មែរ ឬអង់គ្លេស)")
@@ -567,6 +842,11 @@ def _start_tts_flow(message, text: str):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("tts:"))
 def handle_tts_pick(call):
+    if not is_subscribed(call.from_user.id):
+        bot.answer_callback_query(call.id, "🔒 សូមចូលរួម Channel មុនប្រើមុខងារនេះ", show_alert=True)
+        send_force_sub_prompt(call.message.chat.id)
+        return
+
     try:
         _, tts_id, voice_key = call.data.split(":", 2)
     except Exception:
@@ -598,8 +878,12 @@ def handle_tts_pick(call):
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/")
-                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_STATS))
+                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_ENHANCE, BTN_REMOVE_BG, BTN_STATS))
 def handle_search(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+
     query = message.text.strip()
     if len(query) < 2:
         bot.reply_to(message, "⚠️ សូមវាយចំណងជើងឲ្យបានច្បាស់លាស់ជាងនេះ")
@@ -637,6 +921,11 @@ def handle_search(message):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("song:"))
 def handle_pick(call):
+    if not is_subscribed(call.from_user.id):
+        bot.answer_callback_query(call.id, "🔒 សូមចូលរួម Channel មុនប្រើមុខងារនេះ", show_alert=True)
+        send_force_sub_prompt(call.message.chat.id)
+        return
+
     try:
         _, search_id, idx_str = call.data.split(":", 2)
         idx = int(idx_str)

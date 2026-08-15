@@ -1,6 +1,7 @@
-# Kairozen Song Search Bot
+# Kai Music Bot
 
-Bot ស្វែងរក និងទាញយកចម្រៀងតាមចំណងជើង តាមរយៈ Telegram (ភាសាខ្មែរ)។
+Bot ស្វែងរក និងទាញយកចម្រៀងតាមចំណងជើង + បម្លែងអត្ថបទជាសំឡេង (TTS) + ធ្វើឲ្យរូបភាពច្បាស់ +
+កាត់ផ្ទៃខាងក្រោយចេញ តាមរយៈ Telegram (ភាសាខ្មែរ)។
 
 ## មាតិកា package
 
@@ -63,6 +64,9 @@ reset ទៅសូន្យរាល់ពេល update កូដ។ នៅព�
 | `BOT_TOKEN` | ✅ | Token ពី @BotFather |
 | `DATA_DIR` | ស្រេចចិត្ត (default `./data`) | Path ទៅ Persistent Disk |
 | `YTDLP_COOKIES_FILE` | ស្រេចចិត្ត | Path ទៅ cookies.txt ជួយកាត់បន្ថយការចាប់ពេលទាញយក |
+| `ADMIN_IDS` | ស្រេចចិត្ត (default `8266854899`) | Telegram user ID អ្នកគ្រប់គ្រង (comma-separated) |
+| `FORCE_SUB_CHANNEL` | ស្រេចចិត្ត | @username Channel តម្រូវ join (ទុកទទេ = បិទ) |
+| `FORCE_SUB_CHANNEL_LINK` | ស្រេចចិត្ត | Link ចូលរួម Channel (ត្រូវការបើប្រើ FORCE_SUB_CHANNEL) |
 
 ## ការធ្វើតេស្តលើ Termux (មុន deploy)
 

@@ -1,8 +1,9 @@
 FROM python:3.11-slim
 
 # ffmpeg ត្រូវការសម្រាប់ yt-dlp បម្លែងទៅ mp3
+# libglib2.0-0, libgl1 ត្រូវការសម្រាប់ opencv-python-headless (dependency របស់ rembg)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg libglib2.0-0 libgl1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

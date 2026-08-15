@@ -10,6 +10,7 @@ Kai Music Bot
   /tts <អត្ថបទ>   -> បម្លែងអត្ថបទទៅជាសំឡេង (ជ្រើសរើសសំឡេងប្រុស/ស្រី)
   ផ្ញើរូបភាព       -> ធ្វើឲ្យរូបភាពច្បាស់ស្វ័យប្រវត្តិ (upscale + sharpen)
                      ឬចុច "✂️ កាត់ផ្ទៃខាងក្រោយ" ដើម្បីកាត់ background ចេញ
+                     ឬចុច "🔗 ធ្វើរូបភាពជា URL" ដើម្បីទទួល link ថេរ
   /admin          -> (Admin ប៉ុណ្ណោះ) មើល User Data + Broadcast សារ
 
 Environment Variables (កំណត់នៅលើ Render):
@@ -37,6 +38,7 @@ Dependencies (requirements.txt):
   edge-tts
   Pillow
   rembg
+  requests
 """
 
 import os
@@ -54,6 +56,7 @@ from flask import Flask
 from ytmusicapi import YTMusic
 import yt_dlp
 import edge_tts
+import requests
 
 # ---------------------------------------------------------------------------
 # Config
@@ -170,6 +173,7 @@ _KIND_LABELS = {
     "tts": "បម្លែងសំឡេង (TTS)",
     "enhance": "ធ្វើរូបភាពច្បាស់",
     "removebg": "កាត់ផ្ទៃខាងក្រោយ",
+    "img2url": "រូបភាពទៅ URL",
 }
 
 
@@ -451,18 +455,38 @@ def remove_background(input_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Image -> URL (Upload រូបភាពទៅ Catbox.moe ដើម្បីទទួល link ថេរ, ឥតគិតថ្លៃ គ្មានត្រូវការ Key)
+# ---------------------------------------------------------------------------
+def upload_to_catbox(file_path: Path) -> str:
+    """Upload file ទៅ catbox.moe (anonymous, ឥតគិតថ្លៃ, ទុកអចិន្ត្រៃយ៍) -> ត្រឡប់ URL ថេរ"""
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": f},
+            timeout=30,
+        )
+    resp.raise_for_status()
+    url = resp.text.strip()
+    if not url.startswith("http"):
+        raise ValueError(f"Catbox upload response មិនត្រឹមត្រូវ: {url}")
+    return url
+
+
+# ---------------------------------------------------------------------------
 # Main menu buttons (Reply Keyboard - នៅជាប់ជានិច្ចនៅផ្នែកខាងក្រោម chat)
 # ---------------------------------------------------------------------------
 BTN_SEARCH = "🔍 ស្វែងរកចម្រៀង"
 BTN_TTS = "🔊 បម្លែងអត្ថបទជាសំឡេង"
 BTN_ENHANCE = "🖼 ធ្វើឲ្យរូបភាពច្បាស់"
 BTN_REMOVE_BG = "✂️ កាត់ផ្ទៃខាងក្រោយ"
+BTN_IMG_URL = "🔗 ធ្វើរូបភាពជា URL"
 BTN_STATS = "📊 ស្ថិតិរបស់ខ្ញុំ"
 
 MAIN_MENU = types.ReplyKeyboardMarkup(resize_keyboard=True)
 MAIN_MENU.row(BTN_SEARCH, BTN_TTS)
 MAIN_MENU.row(BTN_ENHANCE, BTN_REMOVE_BG)
-MAIN_MENU.row(BTN_STATS)
+MAIN_MENU.row(BTN_IMG_URL, BTN_STATS)
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +507,8 @@ def cmd_start(message):
         "🔍 ស្វែងរក ​និងទាញយកចម្រៀងតាមចំណងជើង\n"
         "🔊 បម្លែងអត្ថបទទៅជាសំឡេង (ខ្មែរ/អង់គ្លេស)\n"
         "🖼 ធ្វើឲ្យរូបភាពច្បាស់ (upscale + sharpen)\n"
-        "✂️ កាត់ផ្ទៃខាងក្រោយចេញ (background removal)\n\n"
+        "✂️ កាត់ផ្ទៃខាងក្រោយចេញ (background removal)\n"
+        "🔗 ធ្វើរូបភាពជា URL (link ថេរអាចចែករំលែក)\n\n"
         "👇 ជ្រើសរើសមុខងារពីប៊ូតុងខាងក្រោម ឬវាយចំណងជើងចម្រៀងផ្ទាល់៖",
         reply_markup=MAIN_MENU,
     )
@@ -540,6 +565,15 @@ def btn_remove_bg(message):
     bot.register_next_step_handler(msg, _process_removebg_photo)
 
 
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_IMG_URL)
+def btn_img_url(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    msg = bot.reply_to(message, "🔗 សូមផ្ញើ<b>រូបភាព</b>ដែលអ្នកចង់បម្លែងទៅជា URL (link ថេរ អាចចែករំលែកបាន)")
+    bot.register_next_step_handler(msg, _process_img_url_photo)
+
+
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == BTN_STATS)
 def btn_stats(message):
     cmd_stats(message)
@@ -585,6 +619,17 @@ def _process_removebg_photo(message):
         bot.reply_to(message, "⚠️ សូមផ្ញើជារូបភាព")
         return
     _run_removebg(message, file_id)
+
+
+def _process_img_url_photo(message):
+    if not is_subscribed(message.from_user.id):
+        send_force_sub_prompt(message.chat.id)
+        return
+    file_id = _extract_image_file_id(message)
+    if not file_id:
+        bot.reply_to(message, "⚠️ សូមផ្ញើជារូបភាព")
+        return
+    _run_img_to_url(message, file_id)
 
 
 def _run_enhance(message, file_id: str):
@@ -636,6 +681,26 @@ def _run_removebg(message, file_id: str):
             cleanup_file(in_path, delay=5)
         if out_path:
             cleanup_file(out_path, delay=20)
+
+
+def _run_img_to_url(message, file_id: str):
+    status = bot.reply_to(message, "🔗 កំពុង Upload រូបភាព...")
+    in_path = None
+    try:
+        in_path = _download_telegram_image(file_id)
+        url = upload_to_catbox(in_path)
+        record_event(message.from_user.id, "img2url")
+        bot.edit_message_text(
+            f"✅ <b>URL របស់រូបភាព (link ថេរ អាចចែករំលែកបាន)៖</b>\n\n<code>{url}</code>",
+            message.chat.id, status.message_id,
+        )
+    except Exception:
+        log.exception("img2url failed")
+        bot.edit_message_text("❌ Upload មិនបានទេ សូមព្យាយាមម្តងទៀត",
+                               message.chat.id, status.message_id)
+    finally:
+        if in_path:
+            cleanup_file(in_path, delay=5)
 
 
 @bot.message_handler(content_types=["photo", "document"])
@@ -878,7 +943,7 @@ def handle_tts_pick(call):
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and not m.text.startswith("/")
-                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_ENHANCE, BTN_REMOVE_BG, BTN_STATS))
+                      and m.text not in (BTN_SEARCH, BTN_TTS, BTN_ENHANCE, BTN_REMOVE_BG, BTN_IMG_URL, BTN_STATS))
 def handle_search(message):
     if not is_subscribed(message.from_user.id):
         send_force_sub_prompt(message.chat.id)

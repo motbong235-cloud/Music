@@ -5,3 +5,4 @@ ytmusicapi
 edge-tts
 Pillow
 rembg
+requests

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: kairozen-song-search-bot
+    env: docker
+    plan: starter          # ត្រូវការសម្រាប់ Persistent Disk ($7/ខែ)
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # ត្រូវបញ្ចូលដោយដៃលើ Render Dashboard
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: song-bot-data
+      mountPath: /data       # Persistent Disk - ទិន្នន័យនៅទីនេះមិនបាត់ពេល deploy/update
+      sizeGB: 1
